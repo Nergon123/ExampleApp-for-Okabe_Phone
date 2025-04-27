@@ -1,10 +1,61 @@
 #include "driver.h"
 
+#define DIB_MS 1000
+#define RESOURCE_ADDRESS 0 
+#define INPUT_LOCATION_Y 200
 MCP23017 mcp = MCP23017(MCP23017_ADDR);
 TFT_eSPI tft = TFT_eSPI();
 
+void DRIVER::chfont(const GFXfont *f, bool is_screen_buffer, TFT_eSprite &sbuffer)
+{
+    if (is_screen_buffer)
+    {
+        sbuffer.setFreeFont(f);
+    }
+    else
+    {
+        tft.setFreeFont(f);
+    }
+}
+
+void DRIVER::chfont(uint8_t f, bool is_screen_buffer, TFT_eSprite &sbuffer)
+{
+    if (is_screen_buffer)
+    {
+        sbuffer.setTextFont(f);
+    }
+    else
+    {
+        tft.setTextFont(f);
+    }
+}
+
+void DRIVER::changeFont(int ch, bool is_screen_buffer, TFT_eSprite &sbuffer)
+{
+    this->currentFont = ch;
+    switch (ch)
+    {
+    case 0:
+        chfont(1, is_screen_buffer, sbuffer);
+        break;
+    case 1:
+        chfont(&FreeSans9pt7b, is_screen_buffer, sbuffer);
+        break;
+    case 2:
+        chfont(&FreeSansBold9pt7b, is_screen_buffer, sbuffer);
+        break;
+    case 3:
+        chfont(&FreeMono9pt7b, is_screen_buffer, sbuffer);
+        break;
+    case 4:
+        chfont(&FreeSans12pt7b, is_screen_buffer, sbuffer);
+        break;
+    }
+}
+
 void DRIVER::init()
 {
+    esp_ota_set_boot_partition(esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, "app0"));
 
     pinMode(TFT_BL, OUTPUT);
     analogWrite(TFT_BL, 0);
@@ -14,7 +65,6 @@ void DRIVER::init()
     mcp.writeRegister(MCP23017Register::GPIO_A, 0x00); // Reset port A
     mcp.writeRegister(MCP23017Register::GPIO_B, 0x00); // Reset port B
     tft.init();
-    esp_ota_set_boot_partition(esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, "app0"));
 }
 
 bool DRIVER::initSDCard(bool fast)
@@ -220,81 +270,336 @@ int DRIVER::getBrightness()
     return currentBrightness;
 }
 
-void DRIVER::drawFromSd(uint32_t pos, int pos_x, int pos_y, int size_x, int size_y, String file_path, bool transp, uint16_t tc)
+void DRIVER::drawCutoutFromSd(SDImage image,
+                              int cutout_x, int cutout_y,
+                              int cutout_width, int cutout_height,
+                              int display_x, int display_y,
+                              String file_path)
 {
     fastMode(true);
-    File file = SD.open(file_path, FILE_READ);
-    if (!file.available())
+
+    // Open the file from the SD card
+    File file = SD.open(file_path);
+    if (!file || !file.available())
+    {
         sysError("FILE_NOT_AVAILABLE");
-    file.seek(pos);
-    if (!transp)
-    {
-        const int buffer_size = size_x * 2;
-        uint8_t buffer[buffer_size];
-
-        for (int a = 0; a < size_y; a++)
-        {
-            file.read(buffer, buffer_size);
-
-            tft.pushImage(pos_x, a + pos_y, size_x, 1, (uint16_t *)buffer);
-        }
+        return;
     }
-    else
+
+    int image_width = image.w;
+
+    // Calculate the starting offset for the cutout in the file
+    uint32_t start_offset = image.address + (cutout_y * image_width + cutout_x) * 2;
+
+    const int buffer_size = cutout_width * 2; // 2 bytes per pixel (16-bit color)
+    uint8_t buffer[buffer_size];
+
+    for (int row = 0; row < cutout_height; row++)
     {
-        const int buffer_size = size_x * 2; // 2 bytes per pixel
-        uint8_t buffer[buffer_size];
+        // Calculate the offset for the current row
+        uint32_t row_offset = start_offset + (row * image_width * 2);
+        file.seek(row_offset);
 
-        for (int a = 0; a < size_y; a++)
+        // Read the row of pixel data into the buffer
+        int bytesRead = file.read(buffer, buffer_size);
+        if (bytesRead != buffer_size)
         {
-            // Read a whole line (row) of pixels at once
-            file.read(buffer, buffer_size);
-
-            int draw_start = -1; // Initialize start of draw segment
-
-            for (int i = 0; i < size_x; i++)
-            {
-                // Reconstruct 16-bit color from two bytes
-                uint16_t wd = (buffer[2 * i] << 8) | buffer[2 * i + 1];
-
-                if (wd != tc)
-                { // If the pixel is not transparent
-                    if (draw_start == -1)
-                    {
-                        draw_start = i; // Start new draw segment
-                    }
-                }
-                else
-                { // Transparent pixel
-                    if (draw_start != -1)
-                    {
-                        // Render segment up to current pixel
-                        tft.pushImage(pos_x + draw_start, pos_y + a, i - draw_start, 1, (uint16_t *)(&buffer[2 * draw_start]));
-                        draw_start = -1; // Reset draw_start
-                    }
-                }
-            }
-
-            // Handle case where last segment reaches the end of the row
-            if (draw_start != -1)
-            {
-                tft.pushImage(pos_x + draw_start, pos_y + a, size_x - draw_start, 1, (uint16_t *)(&buffer[2 * draw_start]));
-            }
+            Serial.println("Error reading row from SD card.");
+            return;
         }
+        tft.pushImage(display_x, display_y + row, cutout_width, 1, (uint16_t *)buffer);
     }
     file.close();
     fastMode(false);
 }
 
-void DRIVER::drawFromSd(uint32_t pos, int pos_x, int pos_y, int size_x, int size_y, bool transp, uint16_t tc, String file_path)
+void DRIVER::drawFromSd(uint32_t pos, int pos_x, int pos_y, int size_x, int size_y, bool is_screen_buffer, TFT_eSprite &sbuffer, String file_path, bool transp, uint16_t tc)
 {
-    drawFromSd(pos, pos_x, pos_y, size_x, size_y, file_path, transp, tc);
+    if (pos == 0)
+        return;
+
+    fastMode(true);
+    if (file_path != resPath)
+    {
+        File file = SD.open(file_path, FILE_READ);
+        if (!file.available())
+            sysError("FILE_NOT_AVAILABLE");
+        file.seek(pos);
+        if (!transp)
+        {
+            const int buffer_size = size_x * 2;
+            uint8_t buffer[buffer_size];
+
+            for (int a = 0; a < size_y; a++)
+            {
+                file.read(buffer, buffer_size);
+
+                tft.pushImage(pos_x, a + pos_y, size_x, 1, (uint16_t *)buffer);
+            }
+        }
+        else
+        {
+
+            const int buffer_size = size_x * 2; // 2 bytes per pixel
+            uint8_t buffer[buffer_size];
+
+            for (int a = 0; a < size_y; a++)
+            {
+                // Read a whole line (row) of pixels at once
+                file.read(buffer, buffer_size);
+
+                int draw_start = -1; // Initialize start of draw segment
+
+                for (int i = 0; i < size_x; i++)
+                {
+                    // Reconstruct 16-bit color from two bytes
+                    uint16_t wd = (buffer[2 * i] << 8) | buffer[2 * i + 1];
+
+                    if (wd != tc)
+                    { // If the pixel is not transparent
+                        if (draw_start == -1)
+                        {
+                            draw_start = i; // Start new draw segment
+                        }
+                    }
+                    else
+                    { // Transparent pixel
+                        if (draw_start != -1)
+                        {
+                            // Render segment up to current pixel
+                            tft.pushImage(pos_x + draw_start, pos_y + a, i - draw_start, 1, (uint16_t *)(&buffer[2 * draw_start]));
+                            draw_start = -1; // Reset draw_start
+                        }
+                    }
+                }
+
+                // Handle case where last segment reaches the end of the row
+                if (draw_start != -1)
+                {
+                    tft.pushImage(pos_x + draw_start, pos_y + a, size_x - draw_start, 1, (uint16_t *)(&buffer[2 * draw_start]));
+                }
+            }
+        }
+        file.close();
+    }
+    else
+    {
+        pos -= RESOURCE_ADDRESS;
+        // Serial.printf("POSITION %d\n", pos);
+
+        if (resources)
+        {
+
+            uint16_t *imgData = (uint16_t *)(resources + (pos & ~1));
+            if (!transp)
+            {
+
+                if (is_screen_buffer)
+                    sbuffer.pushImage(pos_x, pos_y, size_x, size_y, imgData);
+                else
+                    tft.pushImage(pos_x, pos_y, size_x, size_y, imgData);
+            }
+            else
+            {
+
+                if (!sprite.createSprite(size_x, size_y))
+                {
+                    Serial.println("Sprite allocation failed!");
+                    return;
+                }
+
+                sprite.pushImage(0, 0, size_x, size_y, imgData);
+
+                if (is_screen_buffer)
+                    sprite.pushToSprite(&sbuffer, pos_x, pos_y, tc);
+                else
+                    sprite.pushSprite(pos_x, pos_y, tc);
+
+                sprite.deleteSprite();
+            }
+        }
+    }
+
+    fastMode(false);
 }
 
-void DRIVER::drawFromSd(int x, int y, SDImage sprite, String file_path)
+void DRIVER::drawFromSd(uint32_t pos, int pos_x, int pos_y, int size_x, int size_y, String file_path, bool transp, uint16_t tc)
 {
-    drawFromSd(sprite.address, x, y, sprite.w, sprite.h, sprite.transp, sprite.tc, file_path);
+    drawFromSd(pos, pos_x, pos_y, size_x, size_y, false, screen_buffer, file_path, transp, tc);
+}
+void DRIVER::drawFromSd(uint32_t pos, int pos_x, int pos_y, int size_x, int size_y, bool transp, uint16_t tc)
+{
+    drawFromSd(pos, pos_x, pos_y, size_x, size_y, false, screen_buffer, resPath, transp, tc);
+}
+void DRIVER::drawFromSd(int x, int y, SDImage sprite, bool is_screen_buffer, TFT_eSprite &sbuffer)
+{
+    if (sprite.address != 0)
+        drawFromSd(sprite.address, x, y, sprite.w, sprite.h, is_screen_buffer, sbuffer, resPath, sprite.transp, sprite.tc);
+}
+void DRIVER::drawFromSd(int x, int y, SDImage sprite)
+{
+    if (sprite.address != 0)
+        drawFromSd(sprite.address, x, y, sprite.w, sprite.h, sprite.transp, sprite.tc);
 }
 
+char DRIVER::textInput(int input, bool onlynumbers, bool nonl)
+{
+    if (input == -1)
+        return 0;
+    char buttons[12][12] = {
+        " \b0+@\n\r",
+        "1,.?!()\r",
+        "2ABCabc\r",
+        "3DEFdef\r",
+        "4GHIghi\r",
+        "5JKLjkl\r",
+        "6MNOmno\r",
+        "7PQRSpqrs\r",
+        "8TUVtuv\r",
+        "9WXYZwxyz\r",
+        "*\r",
+        "#\r"};
+
+    // nonl - disable new line
+    if (nonl)
+    {
+        buttons[0][5] = '\r';
+    }
+    if (onlynumbers)
+    {
+        buttons[0][2] = '\r';
+        for (int i = 1; i < 12; i++)
+        {
+            buttons[i][1] = '\r';
+        }
+    }
+    bool first = true;
+    char result = 0;
+    int pos = 0;
+    int currentIndex =
+        input >= '0' && input <= '9'
+            ? input - 48
+        : input == '*' ? 10
+        : input == '#' ? 11
+                       : -1;
+    if (currentIndex == -1)
+    {
+        Serial.println("UNKNOWN BUTTON:" + String(input));
+        return 0;
+    }
+
+    for (int i = 0; i < 12; i++)
+    {
+        int b = 0;
+        for (; b < 12; b++)
+        {
+            if (buttons[i][b] == '\r')
+                break;
+        }
+
+        b = 0;
+    }
+    int mil = millis();
+    pos = -1;
+    int curx = tft.getCursorX();
+    int cury = tft.getCursorY();
+    while (millis() - mil < DIB_MS)
+    {
+        curx = tft.getCursorX();
+        cury = tft.getCursorY();
+        int c = buttonsHelding();
+        if (c == input || first)
+        {
+            if (pos < (int)(strchr(buttons[currentIndex], '\r') - buttons[currentIndex]))
+            {
+                mil = millis();
+                pos++;
+                result = buttons[currentIndex][pos];
+                showText(buttons[currentIndex], pos);
+                tft.setCursor(curx, cury);
+            }
+            else
+            {
+                mil = millis();
+                pos = 0;
+                result = buttons[currentIndex][pos];
+                showText(buttons[currentIndex], pos);
+                tft.setCursor(curx, cury);
+            }
+        }
+        first = false;
+    }
+
+    tft.fillRect(0, 300, 240, 30, 0);
+
+    tft.setCursor(curx, cury);
+    bool viewport = false;
+    int h = tft.getViewportHeight();
+    int w = tft.getViewportWidth();
+    int vx = tft.getViewportX();
+    int vy = tft.getViewportY();
+
+    if (tft.getViewportHeight() < 320)
+    {
+        tft.resetViewport();
+        viewport = true;
+    }
+
+    drawCutoutFromSd(SDImage(0x639365, 240, 269, 0, false), 0, INPUT_LOCATION_Y - 51, 120, 20, 0, INPUT_LOCATION_Y);
+    if (viewport)
+    {
+        tft.setViewport(vx, vy, w, h);
+    }
+    if (result == '\r')
+    {
+        return 0;
+    }
+    return result;
+}
+void DRIVER::
+    showText(const char *text, int pos)
+{
+
+    int h = tft.getViewportHeight();
+    int w = tft.getViewportWidth();
+    int vx = tft.getViewportX();
+    int vy = tft.getViewportY();
+    bool viewport = false;
+    if (tft.getViewportHeight() < 320)
+    {
+        tft.resetViewport();
+        viewport = true;
+    }
+
+    int pfont = currentFont;
+    int textColor = tft.textcolor;
+    int textSize = tft.textsize;
+    changeFont(0);
+    tft.setTextSize(2);
+
+    tft.setCursor(0, INPUT_LOCATION_Y);
+
+    for (int i = 0; i < (int)(strchr(text, '\r') - text); i++)
+    {
+
+        if (i != pos)
+            tft.setTextColor(0xFFFF, 0, true);
+        else
+            tft.setTextColor(0xFFFF, 0x001F, true);
+        if (text[i] == '\n')
+            tft.print("NL");
+        else if (text[i] == '\b')
+            tft.print("<-");
+        else
+            tft.print(text[i]);
+    }
+
+    tft.textcolor = textColor;
+    changeFont(pfont);
+    tft.setTextSize(textSize);
+    if (viewport)
+        tft.setViewport(vx, vy, w, h);
+}
 void DRIVER::returnToSystem()
 {
     ESP.restart();
